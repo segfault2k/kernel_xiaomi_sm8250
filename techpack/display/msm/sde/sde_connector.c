@@ -90,15 +90,19 @@ static int sde_backlight_device_update_status(struct backlight_device *bd)
 
 	c_conn = bl_get_data(bd);
 	display = (struct dsi_display *) c_conn->display;
-	if (brightness > display->panel->bl_config.bl_max_level)
-		brightness = display->panel->bl_config.bl_max_level;
+	if (brightness > display->panel->bl_config.brightness_max_level)
+		brightness = display->panel->bl_config.brightness_max_level;
 
-	/* map UI brightness into driver backlight level with rounding */
-	bl_lvl = mult_frac(brightness, display->panel->bl_config.bl_max_level,
-			display->panel->bl_config.brightness_max_level);
+	if (brightness) {
+		int bl_min = display->panel->bl_config.bl_min_level ? : 1;
+		int bl_range = display->panel->bl_config.bl_max_level - bl_min;
 
-	if (!bl_lvl && brightness)
-		bl_lvl = 1;
+		/* map UI brightness into driver backlight level rounding it */
+		bl_lvl = bl_min + DIV_ROUND_CLOSEST((brightness - 1) * bl_range,
+			display->panel->bl_config.brightness_max_level - 1);
+	} else {
+		bl_lvl = 0;
+	}
 
 	if (!c_conn->allow_bl_update) {
 		c_conn->unset_bl_level = bl_lvl;
@@ -775,11 +779,9 @@ static int _sde_connector_update_dirty_properties(
 	return 0;
 }
 
-extern bool is_dimlayer_hbm_enabled;
-bool last_dimlayer_hbm_enabled;
-bool last_dimlayer_status;
 void sde_connector_update_fod_hbm(struct drm_connector *connector)
 {
+	static atomic_t effective_status = ATOMIC_INIT(false);
 	struct sde_crtc_state *cstate;
 	struct sde_connector *c_conn;
 	struct dsi_display *display;
@@ -802,19 +804,13 @@ void sde_connector_update_fod_hbm(struct drm_connector *connector)
 
 	cstate = to_sde_crtc_state(c_conn->encoder->crtc->state);
 	status = cstate->fod_dim_layer != NULL;
-
-	if (last_dimlayer_hbm_enabled == is_dimlayer_hbm_enabled &&
-			status == last_dimlayer_status)
+	if (atomic_xchg(&effective_status, status) == status)
 		return;
 
 	mutex_lock(&display->panel->panel_lock);
-	dsi_panel_set_fod_hbm(display->panel,
-			status ? is_dimlayer_hbm_enabled : false);
-	last_dimlayer_hbm_enabled = is_dimlayer_hbm_enabled;
-	last_dimlayer_status = status;
+	dsi_panel_set_fod_hbm(display->panel, status);
 	mutex_unlock(&display->panel->panel_lock);
-	dsi_display_set_fod_ui(display,
-			status ? is_dimlayer_hbm_enabled : false);
+	dsi_display_set_fod_ui(display, status);
 }
 
 struct sde_connector_dyn_hdr_metadata *sde_connector_get_dyn_hdr_meta(
@@ -893,6 +889,18 @@ static int _sde_connector_mi_dimlayer_hbm_fence(struct drm_connector *connector)
 		return -EINVAL;
 	}
 
+	if (!c_conn->allow_bl_update) {
+		/*Skip 4 frames after panel on to avoid hbm flicker*/
+		if (mi_cfg->dc_type == 1 && dsi_display->panel->power_mode == SDE_MODE_DPMS_ON)
+			skip_frame_count = 4;
+		return 0;
+	}
+
+	if (skip_frame_count) {
+		SDE_INFO("skip_frame_count=%d\n", skip_frame_count);
+		skip_frame_count--;
+		return 0;
+	}
 
 	mi_cfg->layer_fod_unlock_success =
 			c_conn->mi_dimlayer_state.mi_dimlayer_type & MI_FOD_UNLOCK_SUCCESS;
@@ -941,6 +949,10 @@ static int _sde_connector_mi_dimlayer_hbm_fence(struct drm_connector *connector)
 					}
 				}
 
+				if (mi_cfg->delay_after_fod_hbm_on) {
+					sde_encoder_wait_for_event(c_conn->encoder, MSM_ENC_VBLANK);
+				}
+
 				/* Turn off crc after delay of hbm on can avoid flash high
 				 * brightness if DC on (MIUI-1755728) */
 				if (mi_cfg->dc_type == 2 && crc_off_after_delay_of_hbm_on) {
@@ -951,7 +963,8 @@ static int _sde_connector_mi_dimlayer_hbm_fence(struct drm_connector *connector)
 				}
 
 				mi_cfg->fod_hbm_layer_enabled = true;
-			}	sde_crtc_fod_ui_ready(dsi_display, 1, 1);
+				/*sde_crtc_fod_ui_ready(dsi_display, 1, 1);*/
+			}
 		}
 	} else {
 		if (mi_cfg->fod_hbm_layer_enabled == true) {
@@ -962,12 +975,12 @@ static int _sde_connector_mi_dimlayer_hbm_fence(struct drm_connector *connector)
 				sde_encoder_wait_for_event(c_conn->encoder, MSM_ENC_VBLANK);
 			sde_connector_hbm_ctl(connector, DISPPARAM_HBM_FOD_OFF);
 			if (mi_cfg->dc_type)
-				sysfs_notify(&c_conn->bl_device->dev.kobj, NULL, "brightness_clone");
+				sysfs_notify(&c_conn->bl_device->dev.kobj, NULL, "brightness");
 			if (mi_cfg->delay_after_fod_hbm_off)
 				sde_encoder_wait_for_event(c_conn->encoder, MSM_ENC_VBLANK);
 
 			mi_cfg->fod_hbm_layer_enabled = false;
-			sde_crtc_fod_ui_ready(dsi_display, 1, 0);
+			/*sde_crtc_fod_ui_ready(dsi_display, 1, 0);*/
 		}
 	}
 #if 0
@@ -2518,8 +2531,6 @@ static int sde_connector_atomic_check(struct drm_connector *connector,
 		struct drm_connector_state *new_conn_state)
 {
 	struct sde_connector *c_conn;
-	struct sde_connector_state *c_state;
-	bool qsync_dirty = false, has_modeset = false;
 
 	if (!connector) {
 		SDE_ERROR("invalid connector\n");
@@ -2532,19 +2543,6 @@ static int sde_connector_atomic_check(struct drm_connector *connector,
 	}
 
 	c_conn = to_sde_connector(connector);
-	c_state = to_sde_connector_state(new_conn_state);
-
-	has_modeset = sde_crtc_atomic_check_has_modeset(new_conn_state->state,
-						new_conn_state->crtc);
-	qsync_dirty = msm_property_is_dirty(&c_conn->property_info,
-					&c_state->property_state,
-					CONNECTOR_PROP_QSYNC_MODE);
-
-	SDE_DEBUG("has_modeset %d qsync_dirty %d\n", has_modeset, qsync_dirty);
-	if (has_modeset && qsync_dirty) {
-		SDE_ERROR("invalid qsync update during modeset\n");
-		return -EINVAL;
-	}
 
 	if (c_conn->ops.atomic_check)
 		return c_conn->ops.atomic_check(connector,
